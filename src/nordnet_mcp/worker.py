@@ -174,7 +174,8 @@ def create_worker_app() -> Starlette:
                 raise ValueError("invalid generation")
             # Include time waiting for the serialized worker, so queued reads
             # cannot outlive the broker caller or start after it gives up.
-            async with asyncio.timeout(25 if operation in ("transaction_history", "cost_estimate") else None):
+            read_deadline = {"transaction_history": 25, "cost_estimate": 25, "market_data": 8}.get(operation)
+            async with asyncio.timeout(read_deadline):
                 async with lock:
                     transition = operation in ("restore", "disconnect")
                     if (transition and requested <= generation) or (not transition and requested != generation):

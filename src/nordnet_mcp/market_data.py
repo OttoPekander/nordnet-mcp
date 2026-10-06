@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 import json
 import httpx
 from nordnet_mcp.models import ListingIdentity
+from nordnet_mcp import web_feed
 
 _client = None
 
@@ -23,9 +24,10 @@ async def _read(path):
     try:
         return {"status": "observed", "data": await _client.get(path, decimal_strings=True), "path": path}
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code not in (403, 404, 405):
-            raise
-        return {"status": "unsupported", "http_status": exc.response.status_code, "path": path}
+        status = "unsupported" if exc.response.status_code in (403, 404, 405) else "unavailable"
+        return {"status": status, "http_status": exc.response.status_code, "path": path}
+    except httpx.RequestError:
+        return {"status": "unavailable", "reason": "transport_failure", "path": path}
 
 
 def _snapshot(observation, identity):
@@ -89,29 +91,31 @@ async def listing_rules(identity):
             if isinstance(tradable, dict) and tradable.get("market_id") == identity.market_id and str(tradable.get("identifier")) == identity.identifier:
                 matches.append((instrument, tradable))
     if len(matches) != 1:
-        return {"status": "unverified", "reason": "listing_identity_unverified"}
+        return {"status": "unverified", "reason": "listing_identity_unverified", "tradable_identity_matched": False}
     instrument, tradable = matches[0]
+    def unverified_rules(reason):
+        return {"status": "unverified", "reason": reason, "tradable_identity_matched": True}
     tick_id = tradable.get("tick_size_id")
     lot = _number(tradable.get("lot_size"), positive=True)
     if type(tick_id) is not int or tick_id <= 0 or lot is None or Decimal(lot) != Decimal(lot).to_integral_value():
-        return {"status": "unverified", "reason": "listing_rules_unverified"}
+        return unverified_rules("listing_rules_unverified")
     ticks = await _read(f"/tick_sizes/{tick_id}")
     schedules = ticks.get("data")
     schedules = [row for row in schedules if isinstance(row, dict) and row.get("tick_size_id") == tick_id] if isinstance(schedules, list) else []
     if len(schedules) != 1 or not isinstance(schedules[0].get("ticks"), list) or not 1 <= len(schedules[0]["ticks"]) <= 64:
-        return {"status": "unverified", "reason": "tick_schedule_unverified"}
+        return unverified_rules("tick_schedule_unverified")
     bands = []
     for band in schedules[0]["ticks"]:
         if not isinstance(band, dict):
-            return {"status": "unverified", "reason": "tick_schedule_unverified"}
+            return unverified_rules("tick_schedule_unverified")
         lower, upper, tick = _number(band.get("from_price")), _number(band.get("to_price")), _number(band.get("tick"), positive=True)
         if None in (lower, upper, tick) or Decimal(lower) > Decimal(upper):
-            return {"status": "unverified", "reason": "tick_schedule_unverified"}
+            return unverified_rules("tick_schedule_unverified")
         bands.append({"from_price": lower, "to_price": upper, "tick": tick})
     bands.sort(key=lambda band: Decimal(band["from_price"]))
     if any(Decimal(a["to_price"]) >= Decimal(b["from_price"]) for a, b in zip(bands, bands[1:])):
-        return {"status": "unverified", "reason": "tick_schedule_ambiguous"}
-    return {"status": "observed", "source": "nordnet_listing_lookup_and_tick_sizes", "listing": {
+        return unverified_rules("tick_schedule_ambiguous")
+    return {"status": "observed", "tradable_identity_matched": True, "source": "nordnet_listing_lookup_and_tick_sizes", "listing": {
         "instrument_id": str(instrument.get("instrument_id")), "market_id": identity.market_id,
         "identifier": identity.identifier, "mic": tradable.get("mic"), "isin": instrument.get("isin_code"),
         "currency": instrument.get("currency"), "price_unit": tradable.get("price_unit"), "lot_size": int(Decimal(lot)),
@@ -121,11 +125,35 @@ async def listing_rules(identity):
 async def listing_market_data(market_id: int, identifier: str):
     listing = ListingIdentity(market_id, identifier)
     paths = {name: f"/tradables/{name}/{listing.key}" for name in ("depth", "price", "trading_status")}
-    values = await asyncio.gather(*(_read(path) for path in paths.values()), listing_rules(listing))
+    # Feed subscriptions may only use the exact uniquely verified tradable.
+    # Keep the existing REST observation separate; a socket receipt cannot
+    # upgrade its freshness, entitlement or execution capability.
+    rules = await listing_rules(listing)
+    async def feed_observation():
+        if rules.get("tradable_identity_matched") is not True:
+            return {"source": "nordnet_public_web_feed", "reason": "listing_identity_unverified",
+                    "channels": {kind: {"status": "unavailable", "reason": "listing_identity_unverified"}
+                                 for kind in web_feed.CHANNELS}, "execution_ready": False}
+        return await web_feed.observe(_client, listing)
+    values = await asyncio.gather(*(_read(path) for path in paths.values()), feed_observation())
     observations = dict(zip(paths, values[:len(paths)]))
+    feed = values[-1]
+    feed_observations = {}
+    for kind in ("depth", "price", "trading_status"):
+        observation = feed.get("channels", {}).get(kind, {})
+        raw = observation.get("data")
+        if isinstance(raw, dict):
+            raw = {**raw, "market_id": raw["m"], "identifier": raw["i"]}
+        feed_observations[kind] = {**observation, "data": raw}
+    feed["normalized"] = _normalize(feed_observations, listing)
+    feed["normalized"]["price_delay_seconds"] = (
+        feed_observations["price"].get("data") or {}).get("delayed")
+    feed["normalized"]["trade_source_timestamp_ms"] = (
+        feed_observations["price"].get("data") or {}).get("trade_timestamp")
     return {
         "normalized": _normalize(observations, listing),
-        "listing_rules": values[-1],
+        "listing_rules": rules,
+        "web_feed": feed,
         "listing": {"market_id": market_id, "identifier": identifier},
         "source": "nordnet_web_rest_snapshot",
         "received_at": datetime.now(timezone.utc).isoformat(),
