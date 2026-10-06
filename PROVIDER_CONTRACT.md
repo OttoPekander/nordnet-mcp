@@ -41,6 +41,17 @@ current generation. Never reuse a generation following a worker transition.
 - `resolve_listing`, `market_data`, `trading_info`:
   `{market_id:int,identifier:string}`.
 - `entitlements`: no arguments.
+- `fx_rates`: no arguments; raw provider exchange-rate table.
+- `fx_rate`: `{from_currency:string,to_currency:string}`; both currencies must
+  be three ASCII uppercase letters. Direction is explicit, never inferred.
+- `commission_model`: no arguments; provider price models with
+  `include_models=true`. An empty response does not mean zero commission.
+
+These three private reads do not enable a trading capability. The authenticated
+Finland trial on 2026-10-06 returned directional USD/EUR, EUR/USD and SEK/EUR
+values without publication timestamps, and an empty commission-model list.
+Those rates establish response direction, but neither freshness nor an all-in
+EUR cost bound. No fee estimate or order is submitted by these GET operations.
 - `search`: `{query:string,limit:int=20}`; 1..128 printable characters and
   limit 1..50. Uses the documented `free_text_search` parameter, offset 0 and
   ascending name sort. The provider may return up to twice the requested limit

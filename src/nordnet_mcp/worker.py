@@ -31,10 +31,14 @@ _READS = {
     "resolve_listing": lambda a: (f"/instruments/lookup/market_id_identifier/{ListingIdentity(**a).key}", None),
     "trading_info": lambda a: (f"/tradables/info/{ListingIdentity(**a).key}", None),
     "entitlements": lambda a: ("/realtime_access", None),
+    "fx_rates": lambda a: ("/exchange_rates", None),
+    "fx_rate": lambda a: (f"/exchange_rates/{_currency(a['from_currency'])}/{_currency(a['to_currency'])}", None),
+    "commission_model": lambda a: ("/customers/commission/price_model", {"include_models": "true"}),
 }
 _ALLOWED_ARGUMENTS = {
     "epoch": set(), "status": set(), "checkpoint": set(), "disconnect": set(), "auth_start": set(), "auth_poll": set(),
     "restore": {"session_token", "client_id", "market", "excluded_account_numbers"}, "accounts": set(), "entitlements": set(),
+    "fx_rates": set(), "fx_rate": {"from_currency", "to_currency"}, "commission_model": set(),
     "account_info": {"account_id"}, "positions": {"account_id"}, "ledgers": {"account_id"},
     "orders": {"account_id"}, "trades": {"account_id", "days"},
     "resolve_listing": {"market_id", "identifier"}, "market_data": {"market_id", "identifier"},
@@ -43,6 +47,12 @@ _ALLOWED_ARGUMENTS = {
     "modify_limit_order": {"account_id", "order_id", "volume", "price", "currency"},
     "cancel_order": {"account_id", "order_id"},
 }
+
+
+def _currency(value):
+    if not isinstance(value, str) or len(value) != 3 or not value.isascii() or not value.isalpha() or not value.isupper():
+        raise ValueError("Currency must be a three-letter uppercase code")
+    return value
 
 
 def _days(value):
