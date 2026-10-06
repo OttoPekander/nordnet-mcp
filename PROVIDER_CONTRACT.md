@@ -77,8 +77,8 @@ Provider reads were authored against these primary sources on 2026-10-06:
   lookup, calendar/order types, account identities, tick tables, limit orders,
   form data mutation fields and OrderReply result codes.
 - [Official feeds](https://www.nordnet.se/externalapi/docs/feeds): five-level
-  depth and changed-field streaming deltas. This implementation uses snapshots
-  and does not claim to reconstruct a streaming book.
+  depth and changed-field streaming deltas. The web transport described below is
+  distinct from the External API session-key transport.
 - The current Finnish public frontend's
   [redux API reducer bundle](https://www.nordnet.fi/static/nn-vendors-node_modules_webapp-next_redux-api-modeler_dist_index_js-node_modules_webapp-next_red-9abac4.7aad161dc5ad184f9e7d.js)
   declares `/api/2/tradables/depth/{tradableId}`,
@@ -162,3 +162,86 @@ network restoration recovered the normal provider read without a new login.
 The one formal review was `20261006-nordnet-joint-0603e2fa`; confirmed findings
 were repaired and checked against deployed service/browser behavior. No unit
 tests, test doubles, mocks or new financial orders were used.
+
+## Bounded public web-feed observation
+
+`market_data` preserves its existing REST `normalized` and `observations` fields
+and adds `web_feed`, containing independently acknowledged price/depth/status
+channels and a separate normalized observation. It first verifies the requested
+listing through the existing unique tradable lookup. The QR market host must be
+one of www.nordnet.fi/se/no/dk and the client must be NEXT. The only socket route
+is that host's `/ws/2/public`, with NEXT subprotocol and the current session
+cookie; session material never appears in its result. No private feed or paid
+data subscription endpoint is used.
+
+The reader waits for the login acknowledgement and exact identity-matched
+subscription acknowledgement before accepting each channel. Initial depth must
+contain both sides and quantities for the advertised 1..5 levels (five when no
+level count is supplied); initial price requires bid/ask and initial status its
+phase code. Later identity-matched deltas merge into only that call's initial
+snapshot. Provider tick timestamps must be plausible epoch milliseconds and
+nondecreasing. Malformed clocks invalidate that channel. Missing acknowledgments,
+missing initial snapshots and rejected subscriptions remain explicit unavailable
+or unsupported channels without hiding other usable observations.
+
+After the channels settle, it collects deltas until 250 ms of receive inactivity
+or the overall budget. Each observation has a four-second socket deadline, at
+most 64 messages, 256 KiB
+frames and a bounded receive queue. The worker's market-data operation has an
+eight-second total deadline including queue wait and listing/REST requests; it
+never waits unboundedly behind another operation. A fresh call always makes a
+fresh connection. Unexpected disconnect invalidates reconstructed observations;
+no reconnection inherits them. Intentional deadline/normal closure retains only
+historical observations with raw provider source time and local receipt time.
+Heartbeat, socket acknowledgement and receipt are never freshness proof. Raw
+delay fields survive delta merging; an absent delay is unknown, not zero.
+
+Live Finland characterization before implementation accepted Aktia's five depth
+levels and rejected Apple/Infineon price/depth subscriptions on the tested session.
+Those are observed access outcomes, not blanket market entitlements. Full
+exchange-depth coverage, phase contract verification, freshness, entitlements and
+execution readiness remain false. Actual deployed acceptance must still verify
+this implementation; no orders or paid subscription actions are part of it.
+
+### Deployed read-only evidence, 2026-10-06
+
+Worker `sha256:f20d80beb51cd86bd6eeac12c61fdf62a5a3854e56e0d6f5e67daa579c60f5db`
+was exercised through the actual staged facade MCP after worker recreation and
+encrypted session restoration. Aktia's depth, price and status channels were
+acknowledged and returned snapshots; its closed book timestamp remained old,
+with unknown depth delay explicit. Five raw slots contained one positive row
+on each side after normalization. Apple and Infineon returned explicit rejected
+price/depth subscriptions while status remained observable. Calls completed
+in 2.42, 0.65 and 0.65 seconds respectively. No financial writes or paid data
+changes occurred, and every execution/capability flag remained false.
+
+This establishes the bounded transport for these listings, not current
+liquidity, complete exchange depth, entitlement coverage for a market family,
+or the provider clock's freshness semantics. Actual malformed/out-of-order
+frames and connection-loss transitions were not forced; their rejection paths
+were source-reviewed. No unit tests or mocks were used.
+
+Further real scoped MCP reads resolved Investor B (Stockholm), Novo Nordisk B
+(Copenhagen), Equinor (Oslo) and Novo Nordisk ADR (NYSE) from Nordnet search,
+then looked up each exact returned market/identifier. Stockholm, Copenhagen and
+Oslo returned all three web-feed channels with closed phases and old source
+clocks; Oslo supplied five positive bid/ask rows. NYSE rejected price/depth while
+status remained observable. No Icelandair listing was returned by the bounded
+search, so Icelandic instrument access remains unobserved. These samples do not
+claim coverage for all listings or fungibility between an ordinary share and
+its ADR.
+
+The single formal review (`20261006-nordnet-book-calendar-808ec42b`) identified
+identity-versus-rule conflation and loss of independent feed data on optional
+REST errors. Both were corrected: unique tradable matching has its own field,
+skipped channels return explicit unavailable reasons, and HTTP/transport
+failures remain per-source observations. Confirmed session expiry still
+propagates. Updated worker
+`sha256:c6969867aa8522f4c40cc520b1bcd00e8115a8737f86a46dccf4c1c64be9a9aa`
+returned matched identity and observed channels for a real Finnish listing,
+explicit unmatched identity/unavailable channels for an actual nonexistent
+listing, and matched identity/rejected subscriptions for Apple. Its session
+recovered after recreation without owner action. A simultaneous REST outage
+with a successful socket, missing tick metadata on an otherwise matched
+listing, and malformed/regressing live deltas were source-reviewed, not forced;
+no such live outcome is claimed. Financial writes stayed disabled.
