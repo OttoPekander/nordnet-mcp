@@ -123,3 +123,42 @@ No unit tests or mock acceptance were added or run. Source syntax was checked.
 Full U1/U5 live acceptance remains incomplete, and production dispatch must stay
 disabled. The owner explicitly prohibited executable real orders for the test
 round; rejection or inactive orders are not substitutes for that authority.
+
+## Preliminary costs and booked history
+
+- `cost_estimate`: `{account_id:int,market_id:int,identifier:string,side:BUY|SELL,volume:string,price:string}`.
+  Resolves the exact ordinary-share listing and its currency/lot first. Fixed
+  commission/liquidation approximation POSTs are reads, separate from order
+  transport. Returns raw data and validated decimal charge summaries where
+  available, directional preliminary EUR conversion and observation time.
+  `cost_bound_verified` and `execution_ready` remain false. No account-specific
+  estimate is a guaranteed maximum charge or a fresh FX publication.
+- `transaction_history`: `{account_id:int,days:int=7}`, days 0..365.
+  Refreshes the account mapping and derives the provider's separate account ID.
+  Reads the newest 50 booked rows and the same range's transaction count;
+  `range_complete` is true only when the count equals the returned row count.
+  No arbitrary account UUID, cloud host, path or transaction ID is accepted.
+  The modern cloud JWT is minted using the web session and matching CSRF cookie
+  and hidden input; it stays in memory and never leaves the trusted worker.
+  Booked rows are not linked to order IDs by this contract. Tax-reference FX
+  cannot settle execution accounting.
+
+Authenticated Finland staging reads on 2026-10-06 returned usable BUY and SELL
+estimates for Finnish, US and German cash-share listings. A short history range
+was complete; a longer one was capped. Booked share rows exposed quantity,
+price and total charges, without a verified order identifier. No orders were
+submitted. The shared CSRF handshake also replaces the formerly unsuccessful
+periodic authorization refresh; success does not prove a longer session lifetime.
+
+Both new multi-request reads have a 25-second worker budget, including waiting
+for its serialized action lock. Arwen gives them 30 seconds at the broker;
+other broker operations retain their prior timeout. A foreign-currency FX HTTP
+or transport failure retains successfully observed native-currency fees and an
+explicit unavailable-rate reason. Authentication expiry remains an error.
+
+A real staging history read under temporary kernel network latency succeeded
+in 18.44 seconds. Two concurrent slower reads each stopped after 25.01 seconds;
+network restoration recovered the normal provider read without a new login.
+The one formal review was `20261006-nordnet-joint-0603e2fa`; confirmed findings
+were repaired and checked against deployed service/browser behavior. No unit
+tests, test doubles, mocks or new financial orders were used.

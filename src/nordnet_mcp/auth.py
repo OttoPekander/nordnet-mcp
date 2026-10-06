@@ -503,26 +503,19 @@ async def _create_nnapi_session(token: str) -> None:
 
 
 async def _create_authorization_token(token: str) -> None:
-    """Periodic keepalive call only - not the bridge-establishing one (see
-    module docstring and `_create_nnapi_session`, which is). A real
-    logged-in browser tab calls this every ~60s, alongside verify() every
-    ~20s, but it does not appear in the login-page bundle's own code path,
-    so its exact purpose is still a theory. The JWT this returns isn't used
-    for anything here; only the side effect of calling it matters, if the
-    theory holds."""
-    async with httpx.AsyncClient() as http:
-        await http.post(
-            f"https://www.nordnet.{_market}/nnxapi/authorization/v1/tokens",
-            headers={
-                "Accept": "*/*",
-                "Content-Type": "application/json",
-                "Origin": f"https://www.nordnet.{_market}",
-                "Referer": f"https://www.nordnet.{_market}/",
-                "User-Agent": "Mozilla/5.0",
-                "Cookie": f"NNX_SESSION_ID={token}",
-            },
-            json={},
-        )
+    """Reproduce the browser's CSRF-protected authorization refresh.
+
+    The JWT is discarded. A successful refresh cannot establish a guarantee
+    about idle expiry or the provider's absolute session lifetime.
+    """
+    from nordnet_mcp.web_auth import authorization_token
+    from nordnet_mcp.client import SessionExpiredError
+    try:
+        await authorization_token(token, _market)
+    except SessionExpiredError:
+        if _client is not None and _client.session_token == token:
+            _client.session_token = None
+        raise
 
 
 async def _has_valid_session() -> bool:

@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from nordnet_mcp import create_app, auth, instruments, market_data, orders
+from nordnet_mcp import create_app, auth, instruments, market_data, orders, costs
 from nordnet_mcp.client import SessionExpiredError
 from nordnet_mcp.models import ListingIdentity, positive_id
 
@@ -39,6 +39,8 @@ _ALLOWED_ARGUMENTS = {
     "epoch": set(), "status": set(), "checkpoint": set(), "disconnect": set(), "auth_start": set(), "auth_poll": set(),
     "restore": {"session_token", "client_id", "market", "excluded_account_numbers"}, "accounts": set(), "entitlements": set(),
     "fx_rates": set(), "fx_rate": {"from_currency", "to_currency"}, "commission_model": set(),
+    "transaction_history": {"account_id", "days"},
+    "cost_estimate": {"account_id", "market_id", "identifier", "side", "volume", "price"},
     "account_info": {"account_id"}, "positions": {"account_id"}, "ledgers": {"account_id"},
     "orders": {"account_id"}, "trades": {"account_id", "days"},
     "resolve_listing": {"market_id", "identifier"}, "market_data": {"market_id", "identifier"},
@@ -134,6 +136,10 @@ def create_worker_app() -> Starlette:
         if operation in _READS:
             path, params = _READS[operation](arguments)
             return await auth._client.get(path, params=params, decimal_strings=True)
+        if operation == "transaction_history":
+            return await auth._client.transaction_history(positive_id(arguments["account_id"]), arguments.get("days", 7))
+        if operation == "cost_estimate":
+            return await costs.estimate(auth._client, **arguments)
         if operation == "market_data":
             return await market_data.listing_market_data(**arguments)
         if operation == "create_limit_order":
@@ -166,17 +172,20 @@ def create_worker_app() -> Starlette:
                 raise ValueError("invalid operation arguments")
             if type(requested) is not int or not 0 <= requested <= 2**63 - 1:
                 raise ValueError("invalid generation")
-            async with lock:
-                transition = operation in ("restore", "disconnect")
-                if (transition and requested <= generation) or (not transition and requested != generation):
-                    return JSONResponse({"generation": generation, "error": {"code": "stale_generation", "message": "Session generation changed"}}, status_code=409)
-                if transition:
-                    # Fence even a failed restore; older traffic must stay obsolete.
-                    generation = requested
-                    auth._client.session_token = None
-                    auth._pending = None
-                result = await perform(operation, arguments)
-                return JSONResponse({"generation": generation, "result": result})
+            # Include time waiting for the serialized worker, so queued reads
+            # cannot outlive the broker caller or start after it gives up.
+            async with asyncio.timeout(25 if operation in ("transaction_history", "cost_estimate") else None):
+                async with lock:
+                    transition = operation in ("restore", "disconnect")
+                    if (transition and requested <= generation) or (not transition and requested != generation):
+                        return JSONResponse({"generation": generation, "error": {"code": "stale_generation", "message": "Session generation changed"}}, status_code=409)
+                    if transition:
+                        # Fence even a failed restore; older traffic must stay obsolete.
+                        generation = requested
+                        auth._client.session_token = None
+                        auth._pending = None
+                    result = await perform(operation, arguments)
+                    return JSONResponse({"generation": generation, "result": result})
         except SessionExpiredError:
             return JSONResponse({"generation": generation, "error": {"code": "session_expired", "message": "Nordnet authentication required"}}, status_code=401)
         except PermissionError:
@@ -185,7 +194,7 @@ def create_worker_app() -> Starlette:
             return JSONResponse({"generation": generation, "error": {"code": "invalid_request", "message": "Invalid worker operation arguments"}}, status_code=400)
         except httpx.HTTPStatusError as exc:
             return JSONResponse({"generation": generation, "error": {"code": "provider_http", "message": "Nordnet rejected the request", "http_status": exc.response.status_code}}, status_code=502)
-        except httpx.RequestError:
+        except (httpx.RequestError, TimeoutError):
             return JSONResponse({"generation": generation, "error": {"code": "provider_unavailable", "message": "Nordnet transport unavailable"}}, status_code=503)
         except Exception:
             # Avoid exception text/tracebacks containing tokens or request content.
