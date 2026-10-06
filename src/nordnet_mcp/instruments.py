@@ -1,4 +1,5 @@
 import json
+from nordnet_mcp.models import ListingIdentity
 
 _client = None
 
@@ -8,7 +9,35 @@ def configure(client):
     _client = client
 
 
+async def search_stock_listings(query: str, limit: int = 20) -> dict:
+    """Bounded provider search; ticker/name/ISIN is never a listing identity."""
+    if not isinstance(query, str) or not 1 <= len(query.strip()) <= 128 or not query.isprintable():
+        raise ValueError("query must contain 1..128 printable characters")
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("limit must be an integer from 1 to 50")
+    query = query.strip()
+    data = await _client.get(
+        "/instrument_search/query/stocklist",
+        params={"free_text_search": query, "limit": limit, "offset": 0,
+                "sort_attribute": "name", "sort_order": "asc"},
+        decimal_strings=True,
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+        raise ValueError("unsupported provider search response")
+    # The documented service can return up to twice limit across result groups.
+    return {"query": query, "source": "nordnet_stocklist_free_text_search",
+            "provider": {**data, "results": data.get("results", [])[:limit * 2]},
+            "execution_ready": False}
+
+
 def register_tools(app):
+
+    @app.tool()
+    async def resolve_listing(market_id: int, identifier: str) -> str:
+        """Resolve one exact provider listing; never choose a venue from a ticker."""
+        identity = ListingIdentity(market_id, identifier)
+        data = await _client.get(f"/instruments/lookup/market_id_identifier/{identity.key}")
+        return json.dumps({"requested_listing": {"market_id": market_id, "identifier": identifier}, "provider": data}, indent=2)
 
     @app.tool()
     async def get_instrument(instrument_id: str) -> str:
@@ -43,11 +72,13 @@ def register_tools(app):
             query: Search text (company name, ticker, etc.)
             limit: Max results (default 20)
         """
-        data = await _client.get(
-            "/instrument_search/query/stocklist",
-            params={"query": query, "limit": limit},
-        )
-        return json.dumps(data, indent=2)
+        result = await search_stock_listings(query, limit)
+        return json.dumps(result["provider"], indent=2)
+
+    @app.tool()
+    async def search_listings(query: str, limit: int = 20) -> str:
+        """Search candidates across listings; resolve exact venue before agreement."""
+        return json.dumps(await search_stock_listings(query, limit), indent=2)
 
     @app.tool()
     async def check_suitability(instrument_id: int) -> str:

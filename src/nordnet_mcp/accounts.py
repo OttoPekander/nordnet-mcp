@@ -12,7 +12,7 @@ def register_tools(app):
 
     @app.tool()
     async def list_accounts() -> str:
-        """List all Nordnet accounts with IDs and types."""
+        """List permitted account identities and types under the required private protected-account policy. Excluded accounts and balances are never returned."""
         data = await _client.get("/accounts")
         return json.dumps(data, indent=2)
 
