@@ -1,4 +1,6 @@
 import base64
+import json
+from decimal import Decimal
 import os
 import re
 
@@ -22,6 +24,7 @@ class NordnetClient:
         self._client = httpx.AsyncClient()
         self._allowed_account_ids: set[int] = set()
         self._account_numbers_by_id = {}
+        self._history_account_ids = {}
 
     def _auth_header(self) -> dict:
         token = self.session_token or ""
@@ -84,6 +87,7 @@ class NordnetClient:
     def _filter_accounts(self, data):
         self._allowed_account_ids.clear()
         self._account_numbers_by_id.clear()
+        self._history_account_ids.clear()
         if not isinstance(data, list):
             raise PermissionError("Account identity metadata unavailable")
         candidates = []
@@ -105,6 +109,10 @@ class NordnetClient:
                 continue
             if account_id in self._allowed_account_ids or number in self._account_numbers_by_id.values():
                 raise PermissionError("Duplicate account identity")
+            history_id = account.get("account_id")
+            if ((type(history_id) is int and history_id > 0) or
+                    (isinstance(history_id, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", history_id))):
+                self._history_account_ids[account_id] = history_id
             self._allowed_account_ids.add(account_id)
             self._account_numbers_by_id[account_id] = number
             allowed.append({key: account[key] for key in ("accid", "accno", "alias", "type", "atyid") if key in account})
@@ -126,6 +134,82 @@ class NordnetClient:
 
     async def close(self):
         await self._client.aclose()
+
+    async def transaction_history(self, account_id: int, days: int = 7):
+        """Bounded booked-history read using the provider's separate account ID."""
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        if type(days) is not int or not 0 <= days <= 365:
+            raise ValueError("history days must be 0..365")
+        await self._verify_account_scope(account_id)
+        history_id = self._history_account_ids.get(account_id)
+        if history_id is None or list(self._history_account_ids.values()).count(history_id) != 1:
+            raise PermissionError("History account identity unavailable")
+        today = datetime.now(ZoneInfo("Europe/Helsinki")).date()
+        fields = {"accountIds": [history_id], "fromDate": (today - timedelta(days=days)).isoformat(),
+                  "toDate": today.isoformat(), "offset": 0, "limit": 50,
+                  "sort": "ACCOUNTING_DATE", "sortOrder": "DESC", "includeCancellations": True}
+        path = "/transaction/transaction-and-notes/v2/transactions/page"
+        from nordnet_mcp.web_auth import authorization_token
+        market = self.base_url.removesuffix("/api/2").rsplit(".", 1)[-1]
+        jwt = await authorization_token(self.session_token, market)
+        headers = {"Accept": "application/json", "Authorization": "Bearer " + jwt,
+                   "x-locale": {"fi": "fi-FI", "se": "sv-SE", "no": "nb-NO", "dk": "da-DK"}[market]}
+        # Nordnet's frontend selects this fixed cloud host. Never send its
+        # separate JWT to a host or path supplied by model arguments.
+        async with httpx.AsyncClient(timeout=15) as cloud:
+            response = await cloud.post("https://api.prod.nntech.io" + path, headers=headers, json=fields)
+            summary = await cloud.post("https://api.prod.nntech.io/transaction/transaction-and-notes/v2/transaction-summary",
+                                       headers=headers, json={key: fields[key] for key in
+                                       ("accountIds", "fromDate", "toDate", "includeCancellations")})
+        if response.status_code == 401:
+            raise SessionExpiredError("Nordnet authentication required")
+        response.raise_for_status()
+        rows = response.json(parse_float=str)
+        if not isinstance(rows, list) or len(rows) > 50:
+            raise ValueError("history response contract unavailable")
+        if summary.status_code == 401:
+            raise SessionExpiredError("Nordnet authentication required")
+        summary.raise_for_status()
+        total = summary.json().get("totalNumberOfTransactions")
+        if type(total) is not int or total < len(rows):
+            raise ValueError("history coverage contract unavailable")
+        stable = str(self._account_numbers_by_id[int(account_id)])
+        if any(not isinstance(row, dict) or str(row.get("accountNumber")) != stable for row in rows):
+            raise PermissionError("History account identity mismatch")
+        return {"status": "observed", "data": rows, "from_date": fields["fromDate"], "to_date": fields["toDate"],
+                "offset": 0, "limit": 50, "total_transactions": total, "range_complete": total == len(rows), "order_link_verified": False,
+                "tax_reference_fx_is_execution_fx": False}
+
+    async def fee_estimate(self, side: str, account_id: int, fields: dict):
+        """Fixed read-estimate POSTs, independent of the order-write transport."""
+        paths = {"BUY": "/fees/commission_approximation", "SELL": "/fees/liquidation_approximation"}
+        if side not in paths or fields.get("accid") != account_id:
+            raise ValueError("invalid fee estimate identity")
+        await self._verify_account_scope(account_id)
+
+        def encode(value):
+            # Decimal amounts are exact JSON numeric literals, never binary floats.
+            if isinstance(value, Decimal):
+                if not value.is_finite():
+                    raise ValueError("invalid estimate amount")
+                return format(value, "f")
+            if isinstance(value, dict):
+                return "{" + ",".join(json.dumps(k) + ":" + encode(v) for k, v in value.items()) + "}"
+            if isinstance(value, list):
+                return "[" + ",".join(encode(v) for v in value) + "]"
+            if isinstance(value, float):
+                raise ValueError("floating point estimate amount")
+            return json.dumps(value, allow_nan=False)
+
+        response = await self._client.post(
+            self.base_url + paths[side], headers={**self._auth_header(), "Content-Type": "application/json"},
+            content=encode(fields).encode(),
+        )
+        if response.status_code == 401:
+            raise SessionExpiredError("Nordnet authentication required")
+        response.raise_for_status()
+        return response.json(parse_float=str)
 
     async def order_mutation(self, method: str, path: str, fields: dict | None = None) -> dict:
         """Single attempt. Uncertain outcomes must be reconciled, never retried."""

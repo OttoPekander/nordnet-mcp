@@ -63,7 +63,7 @@ def _normalize(observations, identity):
                     levels[name].append({"level": level, "price": amount, "quantity": quantity,
                                          "order_count": _number(depth.get(f"{side}_orders{level}"))})
     raw_halted = phase.get("halted") if phase else None
-    halted = True if raw_halted is True or raw_halted == "true" else False if raw_halted is False or raw_halted == "false" else None
+    no_halted_reason = raw_halted is None or raw_halted is False or raw_halted in ("", "false")
     return {
         "identity_matched": {"depth": depth is not None, "price": price is not None, "trading_status": phase is not None},
         "book": levels,
@@ -73,8 +73,8 @@ def _normalize(observations, identity):
         "delay_seconds": depth.get("delay") if depth else None,
         "phase": phase.get("orderbook_status", "UNKNOWN") if phase else "UNKNOWN",
         "provider_phase_code": phase.get("status") if phase else None,
-        "halted": halted,
-        "continuous_observed": bool(phase and phase.get("status") == "C" and phase.get("orderbook_status") == "CONTINUOUS_TRADING" and halted is False),
+        "halted": raw_halted,
+        "continuous_observed": bool(phase and phase.get("status") == "C" and phase.get("orderbook_status") == "CONTINUOUS_TRADING" and no_halted_reason),
         "contract_verified": False,
     }
 
