@@ -66,8 +66,8 @@ so its exact purpose is still a theory: based on the observed cadence and
 that verify()'s response field is named `hasOnpremSession`, it may refresh
 the same on-prem bridge rather than establish it from scratch. `lifespan()`
 below reproduces both calls at their observed cadence while the server is
-running, so the session keeps sliding forward instead of expiring from
-inactivity.
+running, to reduce idle expiry. This does not override the provider session lifetime;
+a staging session was observed becoming unauthorized after about four hours.
 """
 import asyncio
 import base64
@@ -414,13 +414,11 @@ def register_tools(app):
 
 
 async def _verify_session(token: str) -> bool:
-    """Same request a logged-in browser tab makes periodically to check
-    it's still signed in — this is what actually resets Nordnet's idle
-    timeout, not activity against the separate portfolio data API. Also
-    doubles as the authoritative "is this token still good?" check: it
-    returns 200 with hasOnpremSession true/false rather than erroring on a
-    dead token, so the boolean in the body - not the HTTP status - is what
-    actually answers that question."""
+    """Check the live session without treating a confirmed expiry as an outage.
+
+    Nordnet may return HTTP 401 or a successful response with an absent
+    on-prem session. Transport and other provider errors remain errors.
+    """
     async with httpx.AsyncClient() as http:
         resp = await http.get(
             f"https://www.nordnet.{_market}/nnxapi/authentication/v2/sessions/verify",
@@ -433,6 +431,11 @@ async def _verify_session(token: str) -> bool:
                 "Cookie": f"NNX_SESSION_ID={token}",
             },
         )
+        if resp.status_code == 401:
+            # A late response for an older session cannot clear a new login.
+            if _client is not None and _client.session_token == token:
+                _client.session_token = None
+            return False
         resp.raise_for_status()
         return bool(resp.json().get("hasOnpremSession"))
 
@@ -562,13 +565,8 @@ async def _keepalive_verify_loop():
         if not token:
             continue
         with contextlib.suppress(Exception):
-            # This endpoint returns 200 with {"hasOnpremSession": false}
-            # rather than erroring even for an already-dead session, so
-            # there's no status to react to here - the point is just to
-            # touch the session and reset its idle timer. If it really has
-            # expired, the next real tool call hits a 401 against the data
-            # API and surfaces SessionExpiredError as usual. suppress()
-            # here is only for network-level failures (timeouts, DNS, ...).
+            # A confirmed 401 clears only this token, so both keepalive
+            # loops stop polling it. Network failures retain the session.
             await _verify_session(token)
 
 
@@ -584,9 +582,10 @@ async def _keepalive_token_loop():
 
 @asynccontextmanager
 async def lifespan(app):
-    """Keeps the Nordnet session alive for as long as the server runs, by
-    reproducing the same two periodic calls a real logged-in browser tab
-    makes (see module docstring)."""
+    """Reproduce browser keepalive while a session remains valid.
+
+    Provider expiry still requires a fresh QR login.
+    """
     tasks = [
         asyncio.create_task(_keepalive_verify_loop()),
         asyncio.create_task(_keepalive_token_loop()),
