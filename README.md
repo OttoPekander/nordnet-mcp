@@ -217,7 +217,7 @@ setup](#mcp-client-setup) above instead.
 ## Available tools
 
 ### Accounts
-- `list_accounts` — list all accounts with types and IDs
+- `list_accounts` — List permitted accounts with types and IDs
 - `get_account_info` — balances and buying power
 - `get_positions` — holdings with P&L
 - `get_trades` — executed trades (0-7 days back)
@@ -295,3 +295,33 @@ npx @anthropic-ai/mcpb pack . nordnet-mcp.mcpb
 ## License
 
 MIT
+
+## Arwen fork
+
+This fork retains the upstream read-only MCP interface and adds exact-listing
+market observations and a private broker worker. Financial mutations and session
+checkpointing are available only inside that private worker boundary, with
+writes disabled by default. Authenticated account reads are available independently of order execution.
+See [provider contract](PROVIDER_CONTRACT.md) for operations, deployment settings,
+primary source evidence and outstanding authenticated acceptance.
+
+### Session-scoped transport acceptance
+
+Account reads verify stable provider identities; display aliases do not block
+accounts. Old encrypted checkpoints may contain an `excluded_account_numbers`
+field for format compatibility, but it no longer restricts access.
+
+All financial writes require `NORDNET_ENABLE_ORDER_WRITES=1` and an explicit
+`NORDNET_ORDER_EXECUTION_MODE`. The default mode is `disabled`. Production
+execution additionally depends on the broker's accepted contract and agreed
+trade policy. This fork does not supply those approvals.
+
+A specific operator-authorized place/cancel test uses `acceptance` mode with an
+ephemeral `NORDNET_ACCEPTANCE_MANIFEST_FILE`. Its exact account and insertion
+fields, reference and short expiry are compared before sending. The durable
+`NORDNET_ACCEPTANCE_LEDGER_FILE` (default `/policy/acceptance.sqlite`) records the
+single insertion attempt before network I/O. The attempt is never retried;
+only its acknowledged provider order can be cancelled, with one cancellation
+delivery attempt. Modification is unavailable in acceptance mode. Unknown
+responses require reconciliation. Remove the manifest and restore disabled
+mode after the test; this is not a permanent account restriction.

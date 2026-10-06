@@ -1,7 +1,7 @@
 # src/nordnet_mcp/__init__.py
 from mcp.server.fastmcp import FastMCP
 
-from nordnet_mcp import accounts, auth, instruments, reference
+from nordnet_mcp import accounts, auth, instruments, market_data, orders, reference
 from nordnet_mcp.client import NordnetClient
 from nordnet_mcp.config import load_config
 
@@ -21,12 +21,16 @@ def create_app() -> FastMCP:
     accounts.configure(client)
     instruments.configure(client)
     reference.configure(client)
+    market_data.configure(client)
+    orders.configure(client)
     auth.configure(client, host=config.host)
 
     # Register tools from each module
     app = accounts.register_tools(app)
     app = instruments.register_tools(app)
     app = reference.register_tools(app)
+    app = market_data.register_tools(app)
+    app = orders.register_tools(app)
     app = auth.register_tools(app)
     app = auth.register_resources(app)
 
