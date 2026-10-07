@@ -135,19 +135,34 @@ class NordnetClient:
     async def close(self):
         await self._client.aclose()
 
-    async def transaction_history(self, account_id: int, days: int = 7):
+    async def cloud_account_identity(self, account_id, *, unavailable_message='History account identity unavailable'):
+        await self._verify_account_scope(account_id)
+        key = self._history_account_ids.get(account_id)
+        if key is None or list(self._history_account_ids.values()).count(key) != 1:
+            raise PermissionError(unavailable_message)
+        return key, self._account_numbers_by_id[int(account_id)]
+
+    async def transaction_history(self, account_id: int, days: int = 7, *, from_date=None, to_date=None, offset=0):
         """Bounded booked-history read using the provider's separate account ID."""
         from datetime import datetime, timedelta
         from zoneinfo import ZoneInfo
         if type(days) is not int or not 0 <= days <= 365:
             raise ValueError("history days must be 0..365")
-        await self._verify_account_scope(account_id)
-        history_id = self._history_account_ids.get(account_id)
-        if history_id is None or list(self._history_account_ids.values()).count(history_id) != 1:
-            raise PermissionError("History account identity unavailable")
+        if type(offset) is not int or offset < 0:
+            raise ValueError('history offset must be a nonnegative integer')
+        if (from_date is None) != (to_date is None):
+            raise ValueError('Both history dates are required')
+        history_id, _ = await self.cloud_account_identity(account_id)
         today = datetime.now(ZoneInfo("Europe/Helsinki")).date()
-        fields = {"accountIds": [history_id], "fromDate": (today - timedelta(days=days)).isoformat(),
-                  "toDate": today.isoformat(), "offset": 0, "limit": 50,
+        if from_date is not None:
+            from nordnet_mcp.read_dates import read_date
+            start, end = read_date(from_date), read_date(to_date)
+            if start > end:
+                raise ValueError('Invalid history date range')
+        else:
+            start, end = today - timedelta(days=days), today
+        fields = {"accountIds": [history_id], "fromDate": start.isoformat(),
+                  "toDate": end.isoformat(), "offset": offset, "limit": 50,
                   "sort": "ACCOUNTING_DATE", "sortOrder": "DESC", "includeCancellations": True}
         path = "/transaction/transaction-and-notes/v2/transactions/page"
         from nordnet_mcp.web_auth import authorization_token
@@ -172,13 +187,15 @@ class NordnetClient:
             raise SessionExpiredError("Nordnet authentication required")
         summary.raise_for_status()
         total = summary.json().get("totalNumberOfTransactions")
-        if type(total) is not int or total < len(rows):
+        if type(total) is not int or total < offset + len(rows):
             raise ValueError("history coverage contract unavailable")
         stable = str(self._account_numbers_by_id[int(account_id)])
         if any(not isinstance(row, dict) or str(row.get("accountNumber")) != stable for row in rows):
             raise PermissionError("History account identity mismatch")
         return {"status": "observed", "data": rows, "from_date": fields["fromDate"], "to_date": fields["toDate"],
-                "offset": 0, "limit": 50, "total_transactions": total, "range_complete": total == len(rows), "order_link_verified": False,
+                "offset": offset, "limit": 50, "total_transactions": total, "range_complete": offset == 0 and total == len(rows),
+                "next_offset": offset + len(rows) if rows and offset + len(rows) < total else None,
+                "paging_atomic": False, "order_link_verified": False,
                 "tax_reference_fx_is_execution_fx": False}
 
     async def fee_estimate(self, side: str, account_id: int, fields: dict):
