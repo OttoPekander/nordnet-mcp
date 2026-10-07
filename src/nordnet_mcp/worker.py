@@ -17,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from nordnet_mcp import create_app, auth, instruments, market_data, orders, costs
+from nordnet_mcp import create_app, auth, instruments, market_data, orders, portfolio, costs
 from nordnet_mcp.client import SessionExpiredError
 from nordnet_mcp.models import ListingIdentity, positive_id
 
@@ -40,7 +40,10 @@ _ALLOWED_ARGUMENTS = {
     "epoch": set(), "status": set(), "checkpoint": set(), "disconnect": set(), "auth_start": set(), "auth_poll": set(),
     "restore": {"session_token", "client_id", "market", "excluded_account_numbers"}, "accounts": set(), "entitlements": set(),
     "fx_rates": set(), "fx_rate": {"from_currency", "to_currency"}, "commission_model": set(),
-    "transaction_history": {"account_id", "days"},
+    "transaction_history": {"account_id", "days", "from_date", "to_date", "offset"},
+    "portfolio": {"account_id"},
+    "performance_history": {"account_id", "from_date", "to_date"},
+    "portfolio_metrics": {"account_id", "period"},
     "cost_estimate": {"account_id", "market_id", "identifier", "side", "volume", "price"},
     "account_info": {"account_id"}, "positions": {"account_id"}, "ledgers": {"account_id"},
     "orders": {"account_id"}, "trades": {"account_id", "days"},
@@ -54,7 +57,8 @@ _ALLOWED_ARGUMENTS = {
 
 _READ_BUDGETS = {**{operation: 8 for operation in _READS},
                  'status': 8, 'market_data': 8, 'search': 8, 'tick_sizes': 8,
-                 'epoch': 8, 'checkpoint': 8, 'transaction_history': 25, 'cost_estimate': 25}
+                 'epoch': 8, 'checkpoint': 8, 'transaction_history': 25, 'cost_estimate': 25, 'portfolio': 25,
+                 'performance_history': 25, 'portfolio_metrics': 25}
 
 
 def _currency(value):
@@ -142,8 +146,15 @@ def create_worker_app() -> Starlette:
         if operation in _READS:
             path, params = _READS[operation](arguments)
             return await auth._client.get(path, params=params, decimal_strings=True)
+        if operation == "portfolio":
+            return await portfolio.snapshot(auth._client, positive_id(arguments["account_id"]))
+        if operation == "performance_history":
+            return await portfolio.performance_history(auth._client, positive_id(arguments["account_id"]), arguments["from_date"], arguments["to_date"])
+        if operation == "portfolio_metrics":
+            return await portfolio.metrics(auth._client, positive_id(arguments["account_id"]), arguments.get("period", "ALL"))
         if operation == "transaction_history":
-            return await auth._client.transaction_history(positive_id(arguments["account_id"]), arguments.get("days", 7))
+            return await auth._client.transaction_history(positive_id(arguments["account_id"]), arguments.get("days", 7),
+                from_date=arguments.get("from_date"), to_date=arguments.get("to_date"), offset=arguments.get("offset", 0))
         if operation == "cost_estimate":
             return await costs.estimate(auth._client, **arguments)
         if operation == "market_data":
