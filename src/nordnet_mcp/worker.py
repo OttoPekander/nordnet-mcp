@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import hmac
 import json
 import os
+import time
 from pathlib import Path
 
 import httpx
@@ -49,6 +50,11 @@ _ALLOWED_ARGUMENTS = {
     "modify_limit_order": {"account_id", "order_id", "volume", "price", "currency"},
     "cancel_order": {"account_id", "order_id"},
 }
+
+
+_READ_BUDGETS = {**{operation: 8 for operation in _READS},
+                 'status': 8, 'market_data': 8, 'search': 8, 'tick_sizes': 8,
+                 'epoch': 8, 'checkpoint': 8, 'transaction_history': 25, 'cost_estimate': 25}
 
 
 def _currency(value):
@@ -165,7 +171,7 @@ def create_worker_app() -> Starlette:
                 chunks.append(chunk)
             raw = b"".join(chunks)
             payload = json.loads(raw)
-            if not isinstance(payload, dict) or set(payload) != {"operation", "arguments", "generation"}:
+            if not isinstance(payload, dict) or set(payload) not in ({"operation", "arguments", "generation"}, {"operation", "arguments", "generation", "deadline_ms"}):
                 raise ValueError("invalid request fields")
             operation, arguments, requested = payload["operation"], payload["arguments"], payload["generation"]
             if operation not in _ALLOWED_ARGUMENTS or not isinstance(arguments, dict) or set(arguments) - _ALLOWED_ARGUMENTS[operation]:
@@ -174,7 +180,15 @@ def create_worker_app() -> Starlette:
                 raise ValueError("invalid generation")
             # Include time waiting for the serialized worker, so queued reads
             # cannot outlive the broker caller or start after it gives up.
-            read_deadline = {"transaction_history": 25, "cost_estimate": 25, "market_data": 8}.get(operation)
+            read_deadline = _READ_BUDGETS.get(operation)
+            if 'deadline_ms' in payload:
+                deadline = payload['deadline_ms']
+                if read_deadline is None or type(deadline) is not int or not 0 < deadline <= 2**63 - 1:
+                    raise ValueError('Only read operations accept a deadline')
+                remaining = (deadline - time.time() * 1000) / 1000
+                if remaining <= 0:
+                    raise TimeoutError('Read deadline elapsed')
+                read_deadline = min(read_deadline, remaining)
             async with asyncio.timeout(read_deadline):
                 async with lock:
                     transition = operation in ("restore", "disconnect")
